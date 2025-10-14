@@ -9,7 +9,7 @@ venv/
 # macOS
 .DS_Store
 
-# Data dumps (optional)
+# Data
 data/
 *.csv
 !trades_kalshi_sample.csv
