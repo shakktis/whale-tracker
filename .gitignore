@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.ipynb_checkpoints
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store
+
+# Data dumps (optional)
+data/
+*.csv
+!trades_kalshi_sample.csv
