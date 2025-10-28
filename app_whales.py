@@ -1,16 +1,16 @@
-# app_whales.py — Whale Log (auto-pull Kalshi daily JSON with fallback to latest available)
-# - Tries https://kalshi-public-docs.s3.amazonaws.com/reporting/trade_data_YYYY-MM-DD.json
-# - If 404, looks back up to N days (configurable) to find the latest available file
-# - Normalizes to columns: timestamp, market, price, size, notional
+# app_whales.py — Whale Log with projected direction + timezone toggle
+# - Auto fetches Kalshi daily JSON (with look-back to the latest available day)
+# - Normalizes to: timestamp, market, price, size, notional
 # - Threshold = max(percentile_notional, fixed floor)
-# - Flat whale list for the effective day; CSV download
+# - Shows flat whale table, with "direction_projected", notional in "mio",
+#   and timestamp displayed in SGT or NYT (toggle)
 
+from datetime import datetime, date, timedelta, timezone
 import io
 import json
-from datetime import datetime, date, timedelta, timezone
-import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
 
 # ---------- UI setup ----------
@@ -31,10 +31,14 @@ COMMON_COLMAP = {
     "contracts_traded": "size", "qty": "size", "quantity": "size", "amount": "size", "contracts": "size",
 }
 REQUIRED = {"timestamp", "market", "price", "size"}
+TZ_LABELS = {
+    "SGT (Asia/Singapore)": "Asia/Singapore",
+    "NYT (America/New_York)": "America/New_York",
+}
 
 def et_today() -> date:
+    """Return today's date in ET (rough DST heuristic is fine here)."""
     now_utc = datetime.now(timezone.utc)
-    # crude DST heuristic is fine for our purpose
     offset_hours = 4 if 3 <= now_utc.month <= 11 else 5
     return (now_utc - timedelta(hours=offset_hours)).date()
 
@@ -68,23 +72,31 @@ def expand_dict_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Map columns to required names; keep a tz-aware UTC timestamp for conversion."""
     df = df.rename(columns={c: c.strip().lower() for c in df.columns})
     df = expand_dict_columns(df)
+
     for src, tgt in COMMON_COLMAP.items():
         if src in df.columns and tgt not in df.columns:
             df[tgt] = df[src]
+
     missing = REQUIRED - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns after normalization: {missing}")
-    ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    df["timestamp"] = ts.dt.tz_convert("UTC").dt.tz_localize(None)
+
+    # Parse as tz-aware UTC (keep as aware for later timezone conversion)
+    ts_utc = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df["timestamp_utc"] = ts_utc
+
     df["market"] = df["market"].astype(str)
     df["price"]  = pd.to_numeric(df["price"], errors="coerce")
     df["size"]   = pd.to_numeric(df["size"], errors="coerce")
-    df = df.dropna(subset=["timestamp", "market", "price", "size"])
-    df = df[(df["size"] > 0) & (df["price"] >= 0)].copy()
+
+    df = df.dropna(subset=["timestamp_utc", "market", "price", "size"]).copy()
+    df = df[(df["size"] > 0) & (df["price"] >= 0)]
     df["notional"] = df["price"] * df["size"]
-    df["date"] = df["timestamp"].dt.date
+    # Date in ET (file semantics are ET); for filtering we can use UTC date of timestamp_utc if preferred.
+    df["date_utc"] = df["timestamp_utc"].dt.tz_convert("UTC").dt.date
     return df
 
 def compute_threshold(notional: pd.Series, pct: float, floor_usd: float) -> float:
@@ -94,11 +106,7 @@ def compute_threshold(notional: pd.Series, pct: float, floor_usd: float) -> floa
     return max(q, floor_usd)
 
 def smart_fetch_day(target_day: date, lookback_days: int):
-    """
-    Try target_day; if missing (404), step back day-by-day up to lookback_days.
-    Returns (effective_day, url, df_raw).
-    Raises if nothing found within window.
-    """
+    """Try target_day; if 404, step back up to lookback_days. Return (effective_day, url, raw_df)."""
     tried = []
     for k in range(0, lookback_days + 1):
         d = target_day - timedelta(days=k)
@@ -109,14 +117,42 @@ def smart_fetch_day(target_day: date, lookback_days: int):
         tried.append(url)
     raise FileNotFoundError(f"No daily JSON found from {target_day} looking back {lookback_days} days.\nTried:\n" + "\n".join(tried))
 
+def add_projected_direction(df_day: pd.DataFrame, eps: float = 1e-12) -> pd.DataFrame:
+    """
+    Project direction by comparing price to the previous trade *within the same market*.
+    - price > prev_price + eps ⇒ 'Buy'
+    - price < prev_price - eps ⇒ 'Sell'
+    - otherwise ⇒ 'Flat'
+    """
+    df_day = df_day.sort_values(["market", "timestamp_utc"]).copy()
+    prev_price = df_day.groupby("market")["price"].shift(1)
+    diff = df_day["price"] - prev_price
+    direction = np.where(diff > eps, "Buy",
+                  np.where(diff < -eps, "Sell", "Flat"))
+    df_day["direction_projected"] = direction
+    return df_day
+
+def format_tz(series_utc: pd.Series, tz_name: str) -> pd.Series:
+    """Return a string-formatted timestamp column converted to tz_name."""
+    # Convert from aware UTC to target TZ, then as naive strings for display:
+    local = series_utc.dt.tz_convert(tz_name)
+    return local.dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
 # ---------- sidebar controls ----------
 with st.sidebar:
     st.header("Data & Threshold")
     sel_day = st.date_input("Requested day (ET)", value=et_today())
     auto_latest = st.checkbox("Auto-find latest available (look back)", value=True)
     back_n = st.slider("Look back up to (days)", min_value=0, max_value=10, value=3, disabled=not auto_latest)
-    pct = st.slider("Percentile for whale threshold", min_value=95.0, max_value=99.9, value=99.5, step=0.1)
+
+    st.header("Display")
+    tz_label = st.radio("Timestamp Timezone", list(TZ_LABELS.keys()), index=1)  # default NYT
+    tz_name = TZ_LABELS[tz_label]
+
+    st.header("Whale Threshold")
+    pct = st.slider("Percentile", min_value=95.0, max_value=99.9, value=99.5, step=0.1)
     floor = st.number_input("Backstop floor (USD)", value=20000.0, step=1000.0, min_value=0.0)
+    st.caption("Threshold = max(percentile_notional, floor)")
 
 # ---------- main flow ----------
 try:
@@ -128,36 +164,60 @@ try:
         eff_day = sel_day
 
     df = normalize_df(raw)
-    # Filter to the effective day explicitly
-    df_day = df[df["date"] == eff_day].copy()
-    total_rows = len(df_day)
 
+    # Filter to effective day by UTC date (matches how we parsed timestamps)
+    df_day = df[df["date_utc"] == eff_day].copy()
+    total_rows = len(df_day)
     if total_rows == 0:
         st.warning(f"File exists but contains 0 rows for {eff_day}. Try a nearby day.")
         st.stop()
 
+    # Project direction (per-market price change)
+    df_day = add_projected_direction(df_day)
+
+    # Threshold + whales
     thr = compute_threshold(df_day["notional"], pct=pct, floor_usd=floor)
-    whales = df_day[df_day["notional"] >= thr].sort_values(["notional", "timestamp"], ascending=[False, True])
+    whales = df_day[df_day["notional"] >= thr].copy()
+    whales.sort_values(["notional", "timestamp_utc"], ascending=[False, True], inplace=True)
 
+    # Display metrics
     st.success(f"Fetched {len(raw):,} rows from {used_url}")
-    info1, info2, info3, info4 = st.columns(4)
-    info1.metric("Effective day (ET)", str(eff_day))
-    info2.metric("Whale threshold (USD)", f"{thr:,.0f}")
-    info3.metric("# whale trades", f"{len(whales):,}")
-    info4.metric("Total trades (day)", f"{total_rows:,}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Effective day (ET)", str(eff_day))
+    c2.metric("Whale threshold (USD)", f"{thr:,.0f}")
+    c3.metric("# whale trades", f"{len(whales):,}")
+    c4.metric("Total trades (day)", f"{total_rows:,}")
 
-    st.subheader(f"Whale orders on {eff_day} (sorted by notional desc)")
-    st.dataframe(whales[["timestamp", "market", "price", "size", "notional"]], use_container_width=True)
+    # Build display table
+    whales["notional_mio"] = whales["notional"] / 1e6
+    whales_display = pd.DataFrame({
+        "timestamp": format_tz(whales["timestamp_utc"], tz_name),
+        "market": whales["market"],
+        "price": whales["price"],
+        "size": whales["size"],
+        "notional_mio": whales["notional_mio"].round(3),
+        "direction_projected": whales["direction_projected"],
+    })
+
+    st.subheader(f"Whale orders on {eff_day} — shown in {tz_label}")
+    st.dataframe(whales_display, use_container_width=True)
+
+    # Download (include raw notional and UTC timestamp for analysis)
+    whales_out = whales.assign(
+        timestamp_display=whales_display["timestamp"]
+    )[["timestamp_display", "timestamp_utc", "market", "price", "size", "notional", "notional_mio", "direction_projected"]]
 
     st.download_button(
         "Download whale log (CSV)",
-        whales[["timestamp", "market", "price", "size", "notional"]].to_csv(index=False),
+        whales_out.to_csv(index=False),
         file_name=f"whales_{eff_day}.csv",
         mime="text/csv"
     )
 
-    with st.expander("Preview first rows of the day (pre-threshold)"):
-        st.dataframe(df_day.head(20))
+    with st.expander("Preview first rows (pre-threshold)"):
+        preview = df_day.head(20).copy()
+        preview["timestamp_display"] = format_tz(preview["timestamp_utc"], tz_name)
+        st.dataframe(preview[["timestamp_display", "market", "price", "size", "notional"]])
 
 except requests.HTTPError as e:
     st.error(f"HTTP error fetching Kalshi daily JSON for {sel_day}.\n{e}\nURL tried: {url_for_day(sel_day)}")
